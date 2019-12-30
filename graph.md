@@ -77,7 +77,7 @@ class Edge {
   /***/
   private:
   	Node* src_; // 该边的源节点
-  	Node* dst_; // 改变的目标节点
+  	Node* dst_; // 该边的目标节点
   	int id_;
   	int src_output_; // 生产该数据的节点的输出索引index
   	int dst_input_; // 消费该数据的节点的输入索引index
