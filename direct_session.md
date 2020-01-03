@@ -120,11 +120,53 @@ Rendezvous用于Send/Recv消息发送的 OP,这是一种更为通用的通信方
 
 ### 图的分裂
 
-下一步是根据Placement信息对Graph做切割，然后分发到不同的Device上去执行，主要包括一下三个核心步骤，1.对原图的placement信息做划分，产生多个子图sub_graph;
+下一步是根据Placement信息对Graph做切割，然后分发到不同的Device上去执行，主要包括一下三个核心步骤:
+
+1.对原图的placement信息做划分，产生多个子图sub_graph;
 
 2.为具有跨device依赖的节点对插入Send类和Recv类节点对;
 
 3.插入必要的control edge
 
-在单机单卡的运行过程中，DirectSession会让Graph Partition根据不同的device进行切割，而在分布式运行过程中，Graph Partition会被执行两次，一次是SplitByWorker,另一次是SplitByDevice。
+在单机单卡的运行过程中，DirectSession会让Graph Partition根据不同的device进行切割，而在分布式运行过程中，Graph Partition会被执行两次，一次是SplitByWorker,另一次是SplitByDevice。其主要功能主要在tensorflow/core/graph/graph_partition.cc中的Partition函数。
+
+```c++
+Status Partition(const PartitionOptions& opts, Graph* g,
+                 std::unordered_map<string, GraphDef>* partitions) {
+    /***/
+    if (!opts.control_flow_added) {
+        // 用于在分布式执行中添加控制流代码
+        status = AddControlFlow(opts, g, &g_info);
+        if(!status.ok) return status;
+    }
+    // 在该时候所有图的转变已经完成，该步为图中所有节点和边创建内存和设备类型信息
+    status = BuildMemoryDeviceInfo(*g, &g_info);
+  	if (!status.ok()) return status;
+
+    std::vector<const Edge*> inputs;
+    for (const Node* dst:g->op_nodes()) {
+        // 从原图中取出一个节点dst,根据dst节点的location信息，得到其被放置的对应的partiotion图中
+        dstp = opts.node_to_loc(dst);
+        GraphDef* dst_graph = &(*partitions)[dstp];
+        /***/
+        for (const Edge* edge : dst->in_edges()) {
+            // 遍历该节点所有的输入边
+            if (edge->IsControlEdge()) {
+                /***/
+                inputs.push_back(edge);
+            } else {
+                /***/
+                inputs[edge->dst_input()] = edge;
+                ++num_input_edges;
+            }
+        }
+    }
+    // 按照顺序遍历该节点的数据输入边
+    for (const Edge* edge : inputs) {
+        // 获取该节点的上游节点及上游节点所在图
+        const Node* src = edge->src();
+        GraphDef* src_graph = &(*partitions)[opts.node_to_loc(src)];
+    }
+}
+```
 
