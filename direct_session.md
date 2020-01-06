@@ -163,10 +163,141 @@ Status Partition(const PartitionOptions& opts, Graph* g,
     }
     // 按照顺序遍历该节点的数据输入边
     for (const Edge* edge : inputs) {
-        // 获取该节点的上游节点及上游节点所在图
-        const Node* src = edge->src();
-        GraphDef* src_graph = &(*partitions)[opts.node_to_loc(src)];
+      // 获取该节点的上游节点及上游节点所在图
+      const Node* src = edge->src();
+      GraphDef* src_graph = &(*partitions)[opts.node_to_loc(src)];
+      if (src_graph == dst_graph && !NeedSameDeviceSendRecv(edge, g_info)) {
+        // 若src,dst所在图为相同图，而且设置相同设备下不需要send,recv节点，直接连接两个节点，
+        // src->dst
+        AddInput(dst_def, src->name(), edge->src_output());
+        /***/
+        continue;
+      }
+      /***/
+      // 通过src,edge信息拼出所需要recv的key
+     	const bool on_host = IsDstInputOnHost(edge, g_info);
+      DupRecvKey key{src->id(), edge->src_output(), dst_graph, on_host};
+      // 从缓存哈希表<key,recvInfo>查找信息
+      auto iter = dup_recv.find(key);
+      if (iter != dup_recv.end()) {
+        // 若在缓存哈希表中找到，复用send,recv节点
+        const string& recv_node_name = iter->second.recv->name();
+        if (edge->IsControlEdge()) {
+          // 为dst节点添加输入recv node
+          AddInput(dst_def, recv_node_name, Graph::kControlSlot);
+        } else {
+          // 为dst节点添加输入recv node
+          AddInput(dst_def, recv_node_name, 0);
+        }
+        /***/
+        continue;
+      }
+      
+      NodeDefBuilder::NodeOut send_from;
+      if (edge->IsControlEdge()) {
+        // 若该边类型为控制边,创建一个const dummy节点
+        NodeDef* dummy = AddDummyConst(opts, src_graph, edge, &status);
+        if (!status.ok()) return status;
+        // 将src节点与dummy节点相连，src->dummy，dummy节点作为send节点的输入
+        AddInput(dummy, src->name(), Graph::kControlSlot);
+        send_from.Reset(dummy->name(), 0, DT_FLOAT);
+      } else {
+        // 若该类型为数据边，src节点作为send节点的输入
+        send_from.Reset(src->name(), edge->src_output(), EdgeType(edge));
+      }
+      
+      // 创建一个send节点
+      NodeDef* send = AddSend(opts, g_info, src_graph, edge, send_from, 
+                              send_start_time, &status);
+      // 创建一个recv节点
+      NodeDef* real_recv = nullptr;
+      NodeDef* recv = AddRecv(opts, g_info, dst_graph, edge, &real_recv, &status);
+      
+      if (src_graph == dst_graph) {
+        // 连接send，recv节点，send->recv,若在同一台设备上，则标记该边为控制边
+        AddInput(real_recv, send->name(), Graph::kControlSlot);
+      } else if (control_flow_edge != nullptr) {
+        --num_control_flow_edges;
+        AddInput(real_recv, control_flow_edge->src()->name(),
+                 Graph::kControlSlot);
+      }
+      /***/
+      if (edge->IsControlEdge()) {
+        ++num_control;
+        // 连接dst,recv节点，recv->dst，标记该边为控制边
+        AddInput(dst_def, recv->name(), Graph::kControlSlot);
+      } else {
+        ++num_data;
+        // 连接dst,recv节点，recv->dst
+        AddInput(dst_def, recv->name(), 0);
+      }
     }
+  /***/
+}
+```
+
+创建send和recv节点可以概括以下三种情况:
+
+1.若src和dst节点在同一设备上，将两个节点相连，将连接边标记为控制边；
+
+2.若src和dst节点在不同设备上，连接边为控制边，创建一个DummyConst节点，将其作为send节点的唯一输入，src->dummyconst->send->recv->dst;
+
+3.若src和dst节点在不同设备上，连接边为数据边，直接连接send和recv，src->send->recv->dst。
+
+### 图的执行
+
+图的执行主要依靠执行器完成，执行器的应用可以概括如下
+
+```c++
+Graph* graph = ...;//构建图
+Executor* executor;
+NewSimpleExecutor(my_device, graph, &executor);//生成执行器
+Rendezvous* rendezvous = NewNaiveRendezvous();//构建通信通道
+rendezvous->Send("input", some_input_tensor);//提供输入
+executor->Run({ExecutorOpts, rendezvous, nullptr});
+rendezvous->Recv("output",&output_tensor);//获得输出
+```
+
+执行器的本身的接口定义在tensorflow/core/common_runtime/executor.h中
+
+```c++
+class Exexutor {
+  /***/
+  struct Args {
+    int64 step_id = 0; // 是一个进程级别的唯一标识符，用来标识执行的步骤。当一个步骤运行了一个需要在多个设备上执行的op时，这些不同设备上的执行器将会收到相同的step_id。step_id是被用来追踪一个步骤中用到的资源的。
+    RendezvousInterface* rendezvous = nullptr; // 通信接口，作为图之间通信的机制
+    StepStatsCollectorInterface* stats_collector = nullptr; // 收集统计信息
+    CallFrameInterface* call_frame = nullptr; // 如果该执行器用于执行一个函数，可以使用callframe，用来在调用者和被调用者之间传递参数和返回值
+    CancellationManager* cancellation_manager = nullptr; // cancellation_manager用于执行一些注册一些在图被取消执行的回调函数
+    SessionState* session_state = nullptr;
+    // Unique session identifier. Can be empty.
+    string session_handle;
+    TensorStore* tensor_store = nullptr;
+    ScopedStepContainer* step_container = nullptr;
+    CollectiveExecutor* collective_executor = nullptr;
+    thread::ThreadPoolInterface* user_intra_op_threadpool = nullptr;
+
+    // If true, calls Sync() on the device.
+    bool sync_on_finish = false;
+
+    typedef std::function<void()> Closure;
+    typedef std::function<void(Closure)> Runner; // 将代执行的闭包交给runner执行，runner背后都有线程池支持
+    Runner runner = nullptr;
+  };
+  
+  typedef std::function<void(const Status&)> DoneCallback;
+  virtual void RunAsync(const Args& args, DoneCallback done) = 0;
+  // 对RunAsync()进行封装得到的同步版本.
+  virtual Status Run(const Args& args) {
+    Status ret;
+    Notification n;
+    RunAsync(args, [&ret, &n](const Status& s) {
+      ret = s;
+      n.Notify();
+    });
+    n.WaitForNotification();
+    return ret;
+  }
 }
 ```
 
