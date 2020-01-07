@@ -301,3 +301,455 @@ class Exexutor {
 }
 ```
 
+###### ExecutorBarrier
+
+在实际应用中，可能用到多个执行器，为了使多个执行器并行执行，需要对这些执行的执行器进行管理，设置ExecutorBarrier类，相当于为多个Executor设置栅栏(barrier)，该类的定义如下:
+
+```c++
+class ExecutorBarrier {
+public:
+    typedef std::function<void(const Status&)> StatusCallback;
+    // 为num个不同的executor创建barrier,r是一个共享的数据传输通道，如果任意一个执行器失败，rendezvous仅会崩溃一次，等最后一个执行器被执行完毕，就会调用回调函数done.
+    ExecutorBarrier(size_t num, Rendezvous* r, StatusCallback done)
+      : rendez_(r), done_cb_(done), pending_(num) {}
+    // 获取所有执行器执行完成后调用的函数
+    StatusCallback Get() {
+        return std::bind(&ExecutorBarrier::WhenDone, this, std::placeholders::_1);
+    }
+private:
+    Rendezvous* rendez_ = nullptr;
+    StatusCallback done_cb_ = nullptr;
+    /***/
+}
+```
+
+###### NodeItem
+
+NodeItem表示执行过程中图的一个节点，该结构体定义如下：
+
+```c++
+struct NodeItem {
+    // 在执行图中的节点的index
+    int node_id = -1;
+    /***/
+    // 该节点的kernel
+    OpKernel* kernel = nullptr;
+    
+    int num_inputs;
+  	int num_outputs;
+    
+    // 输入的起始索引
+    int input_start = 0;
+    // 输出边的数量
+    size_t num_output_edges;
+    /***/
+}
+```
+
+###### GraphView
+
+为了执行效率，执行器对一些基础结构进行了简化，剔除了不必要的信息，例如，对于计算图来说，在执行过程中，不需要对图结果进行更改，因此原来Graph中很多修改图的接口都没用了，所以tensorflow提供了一个不可更改的视图，用于使图的执行更加高效。该类的定义如下：
+
+```c++
+class GraphView {
+public:
+    GraphView() : space_(nullptr) {}
+    void Initialize(const Graph* g);// 根据图Graph进行初始化
+    NodeItem* node(size_t id) const;// 根据id返回相应的节点信息
+    /***/
+private:
+    char* InitializeNode(char* ptr, const Node* n); // 初始化node
+    size_t NodeItemBytes(const Node* n); // 根据node获取相应nodeitem占用字节数
+    int32 num_nodes = 0; // 节点数量
+    uint32* node_offsets_ = nullptr; // 节点偏置，node_offsets_[id]保存了节点id在space_中的偏置量
+    char* space_; // 所有NodeItem对象的内存空间
+}
+```
+
+该结构分配了一块内存空间，将图中所有的节点信息都依次存入该空间中，我们仍然能访问图中节点所有的静态信息，但无法对节点信息进行修改。
+
+###### ExecutorImpl
+
+Executor只是一个基类，真正执行器的实现tensorflow提供了一个子类ExecutorImpl,它的结构如下
+
+```c++
+class ExecutorImpl : public Executor {
+public:
+    /***/
+    // 初始化过程中会为每个node的kernel进行实例化
+    Status Initialize(const Graph& graph);
+    void RunAsync(const Args& args, DoneCallback done) override;
+private:
+    struct ControlFlowInfo {
+        // 包含帧的名称，提供了set和vector两种方式，set为了更方便查找某个帧的名称是否包含在内。而vector包含了帧的详细信息，主要是输入数量，以及未完成的节点计数等信息。
+        gtl::FlatSet<string> unique_frame_names;
+        std::vector<string> frame_names;
+    };
+    
+    // 图执行过程中的帧信息主要是为了控制结构准备的
+    struct FrameInfo {
+        // 帧的输入数量
+        int input_count;
+        // 帧的各节点输入张量数量的总和
+        int total_inputs;
+        // 决定了我们最终创建的pending_counts数据结构在将要被分配的内存中的位置
+        PendingCounts::Layout pending_counts_layout;
+        // 每个帧都包含它自己的PendingCounts信息，只针对当前帧中的节点
+        PendingCounts* pending_counts;
+    }
+    
+    // 构建控制流信息
+    static Status BuildControlFlowInfo(const Graph* graph,
+                                     ControlFlowInfo* cf_info);
+    // 初始化待执行计数信息
+    void InitializePending(const Graph* graph, const ControlFlowInfo& cf_info);
+    // 确认每个FrameInfo都已经准备好了
+    FrameInfo* EnsureFrameInfo(const string& fname);
+    
+    // 被当前对象拥有
+    LocalExecutorParams params_;
+    GraphView gview_;
+    
+    // 不依赖任何输入边的根节点，由它们组成初始输入队列
+    std::vector<const NodeItem*> root_nodes_;
+    
+    // frame名称与frameinfo的映射表
+    gtl::FlatMap<string, FrameInfo*> frame_info_;
+  
+}
+```
+
+###### ExecutorState
+
+在执行器执行图的计算过程中，需要一个结构来保存当前计算的信息，该结构即为ExecutorState，它会在一个节点准备好之后再调用该节点。
+
+```c++
+class ExecutorState {
+public:
+    void RunAsync(Executor::DoneCallback done);
+private:
+    // Entry要么是一个张量指针，要么是一个张量值，为图中的节点输入输出提供一个统一的类型
+    struct Entry{}
+    // 执行步骤开始时分配的设备上下文信息
+    DeviceContext* device_context_ = nullptr;
+    
+    struct TaggedNode;
+  	typedef gtl::InlinedVector<TaggedNode, 8> TaggedNodeSeq;
+  	typedef gtl::InlinedVector<Entry, 4> EntryVector;
+    
+    // 代表一轮迭代时的状态
+    struct IterationState {
+        // 每一轮迭代都有一个单独的拷贝，对于第K轮迭代，第i个节点的第j个输入在input_tensors[k][impl_-         // >nodes[i].input_start + j]
+        Entry* input_tensors;
+        // 每一轮迭代中未完成的op的数量
+        size_t outstanding_ops;
+        
+        // 每一轮迭代未完成的帧数量
+        int outstanding_frame_count;
+        int pending(PendingCounts::Handle h);
+        int decrement_pending(PendingCounts::Handle h, int v);
+        
+        // 将一个merge节点标记为live
+        void mark_live(PendingCounts::Handle h);
+        // 标记一个节点开始处理
+        void mark_started(PendingCounts::Handle h)
+        // 标记一个节点处理完成
+        void mark_completed(PendingCounts::Handle h)
+        // 获取节点状态
+        PendingCounts::NodeState node_state(PendingCounts::Handle h)
+        /***/
+    }
+    
+    // FrameState代表一个帧的状态
+    struct FrameState {
+        const ExecutorImpl* executor = nullptr; // 帧所在的执行器
+        string frame_name; // 是由父帧，迭代轮次，frame_name字段拼合起来的
+        unit64 frame_id; // 当前帧的唯一标识
+        int64 parent_iter = -1; //该帧创建时父帧的迭代轮次
+        FrameState* parent_frame = nullptr; // 父帧的帧状态
+        const int max_parallel_iterations; // 最大允许并行迭代数量
+        /***/
+    }
+    
+    // TaggedNode代表一个有标签的节点：<frame*, iter, node*>
+    struct TaggedNode {
+        const NodeItem* node_item;
+        FrameState* input_frame = nullptr;
+        int64 input_iter = -1;
+        bool is_dead = false;
+        /***/
+    };
+    
+    // TaggedNodeReadyQueue表示TaggedNode的一个队列
+    class TaggedNodeReadyQueue {
+        void push_back(TaggedNode node);
+        void pop_front()
+        /***/
+    private:
+        gtl::InlinedVector<TaggedNode, 16> ready_;
+        /***/
+    }
+    
+    // 当前步骤开始执行的根帧
+    FrameState* root_frame_;
+    
+    // 在当前线程中处理一个已经准备好的节点
+    void Process(TaggedNode node, int64 scheduled_nsec);
+	// 在调用item->kernel之前，填入它的输入    
+    Status PrepareInputs(const NodeItem& item, Entry* first_input,
+                           TensorValueVec* inputs,
+                           AllocatorAttributeVec* input_alloc_attrs,
+                           bool* is_input_dead);
+    // 在调用item->kernel之后，处理它的输出
+    Status ProcessOutputs(const NodeItem& item, OpKernelContext* ctx,
+                        EntryVector* outputs, NodeExecStatsInterface* stats);
+    // 在处理完输出之后，将输出传递给下一个节点的输入
+	void PropagateOutputs(const TaggedNode& tagged_node, const NodeItem* item,
+                        EntryVector* outputs, TaggedNodeSeq* ready);
+    // 节点计算结束后，接管stats
+    bool NodeDone(const Status& s, const TaggedNodeSeq& ready,
+                NodeExecStatsInterface* stats,
+                TaggedNodeReadyQueue* inline_ready);
+    // 调度ready中所有的复杂节点，然后将ready中的非复杂节点放入inline_ready中
+    void ScheduleReady(const TaggedNodeSeq& ready,
+                     TaggedNodeReadyQueue* inline_ready);
+  	
+    // 执行器执行完成后对资源进行清理
+    void Finish();
+  	void ScheduleFinish();
+    
+}
+```
+
+###### 执行过程
+
+对于在direct_session中调用的执行器的Run或者RunAsync方法，最终调用的是ExecutorState的RunAsync方法
+
+```c++
+void ExecutorState::RunAsync(Executor::DoneCallback done) {
+    // 构建准备节点队列
+    TaggedNodeSeq ready;
+    
+    // 让设备填充设备上下文映射
+    Device* device = impl_->params_.device;
+    const Status get_context_status =
+      device->TryGetDeviceContext(&device_context_);
+    /***/
+    
+    // 初始化ready队列
+    for (const NodeItem* item : impl_->root_nodes_) {
+        ready.push_back(TaggedNode{item, root_frame_, 0, false});
+    }
+    if (ready.empty()) {
+        // 若ready为空，直接执行完成
+        delete this;
+        done(Status::OK());
+    } else {
+        num_outstanding_ops_ = ready.size();
+        {
+            mutex_lock l(root_frame_->mu);
+            root_frame_->GetIteration(0)->outstanding_ops = ready.size();
+        }
+        done_cb_ = std::move(done);
+        // 在线程池中开始对ready中的节点进行调度运算
+        ScheduleReady(ready, nullptr);
+    }
+}
+```
+
+上述函数主要是对ready队列进行初始化，然后启动ScheduleReady函数
+
+```c++
+void ExecutorState::ScheduleReady(const TaggedNodeSeq& ready,
+                                  TaggedNodeReadyQueue* inline_ready) {
+    /***/
+    if (inline_ready == nullptr) {
+        //inline_ready为空，直接在线程池中对所有的准备好的节点调度运行
+        for (auto& tagged_node : ready) {
+            // runner即为在Executor::Args中定义的std::function,其中Process即为它的闭包函数
+            runner_([=]() { Process(tagged_node, scheduled_nsec); });
+        }
+        return;
+    }
+    
+    // inline_ready不为空时
+    const TaggedNode* curr_expensive_node = nullptr;
+    for (auto& tagged_node : ready) {
+        const NodeItem& item = *tagged_node.node_item;
+        if (tagged_node.is_dead || !item.kernel->IsExpensive()) {
+            // 将非复杂节点放入内联队列中
+            inline_ready->push_back(tagged_node);
+        } else {
+            if (curr_expensive_node) {
+                // 对于当前线程已经在处理一个复杂节点，将该任务分配给其他线程
+                runner_(std::bind(&ExecutorState::Process, this, *curr_expensive_node,
+                          scheduled_nsec));
+            }
+            curr_expensive_node = &tagged_node;
+        }
+    }
+    if (curr_expensive_node) {
+        if (inline_ready->empty()) {
+            inline_ready->push_back(*curr_expensive_node);
+        } else {
+            runner_(std::bind(&ExecutorState::Process, this, *curr_expensive_node,
+                        scheduled_nsec));
+        }
+    }
+}
+```
+
+可以看出该函数的两个参数，一个是待执行的节点队列，一个是待执行的内联节点队列，分了两种情况进行处理：
+
+1.内联节点队列为空时，会为ready队列中的每一个节点，单独新增一个执行线程，也就是说对于根执行队列中的节点，分别新增了一个线程来执行。
+
+2.inline_ready不为空，该函数不会进行任何实际的执行，只会对执行进行分配，它会遍历ready中的每个节点，如果该节点已经死亡或者为非复杂节点，将其放入inline_ready队列等待执行，否则就单独开启一个线程来处理它，同时这个遍历过程执行完成后，会保留最后一个复杂节点，这是若inline_ready为空，就把这个复杂节点放入内联队列，否则开启一个线程执行。
+
+从上面的代码可以看出，整个执行的核心在于Process函数。
+
+```c++
+void ExecutorState::Process(TaggedNode tagged_node, int64 scheduled_nsec) {
+    /***/
+    TaggedNodeSeq ready;
+    TaggedNodeReadyQueue inline_ready;
+    
+    // 为OpKernel::Compute准备参数
+    OpKernelContext::Params params;
+    /***/
+    
+    inline_ready.push_back(tagged_node);
+    while (!inline_ready.empty()) {
+        // 当inline_ready中节点非空时，取出队头节点，获取节点，帧信息
+        tagged_node = inline_ready.front();
+        inline_ready.pop_front();
+        const NodeItem& item = *tagged_node.node_item;
+        FrameState* input_frame = tagged_node.input_frame;
+        const int64 input_iter = tagged_node.input_iter;
+        const int id = item.node_id;
+        /***/
+        // 准备输入
+        s = PrepareInputs(item, first_input, &inputs, &input_alloc_attrs,
+                        &is_input_dead);
+        /***/
+        // 若kernel是异步调用
+        if (item.kernel_is_async) {
+            // 构建异步调用kernel
+            AsyncOpKernel* async = item.kernel->AsAsync();
+            // 构建kernel执行完成后调用的lambda函数
+            auto done = [this, state]() {
+                /***/
+                PropagateOutputs(state->tagged_node, state->item, &outputs, &ready);
+                const bool completed = NodeDone(s, ready, stats, nullptr);
+          		delete state;
+          		if (completed) ScheduleFinish();
+            }
+            /***/
+            // 执行kernel函数
+            device->ComputeAsync(async, &state->ctx, done);
+        } else {
+            // 同步调用
+            OpKernelContext ctx(&params, item.num_outputs);
+            /***/
+            device->Compute(op_kernel, &ctx);
+            s = ProcessOutputs(item, &ctx, &outputs, stats);
+        }
+        
+        if (!launched_asynchronously) {
+            /***/
+            PropagateOutputs(tagged_node, &item, &outputs, &ready);
+            completed = NodeDone(s, ready, stats, &inline_ready);
+        }
+    }
+    if (completed) ScheduleFinish();
+}
+```
+
+可以概括为以下几个步骤：
+
+1.准备输入
+
+2.调用设备进行compute
+
+3.对输出进行处理
+
+4.将输出传递给下一个节点的输入
+
+5.节点处理完成后调用回调函数NodeDone
+
+其中输入，输出的处理函数比较容易理解，就是对相关参数进行填充，下面主要对PropagateOutputs函数和NodeDone函数进行分析。
+
+```c++
+void ExecutorState::PropagateOutputs(const TaggedNode& tagged_node,
+                                     const NodeItem* item, EntryVector* outputs,
+                                     TaggedNodeSeq* ready) {
+    /***/
+    // 沿着输出边传递输出，把准备好的节点放入ready队列中，根据不同的节点类型，选择合适的处理方法
+    if (!item->is_enter_exit_or_next_iter) {
+        // 若节点不是enter,exit,next_iter中的一种
+        output_frame->ActivateNodes(item, is_dead, output_iter, outputs, ready);
+        input_frame->DecrementOutstandingOpsLocked(&impl_->gview_, input_iter, ready);
+    } else if (item->is_enter) {
+        // 若节点类型是enter
+        FindOrCreateChildFrame(input_frame, input_iter, *item, &output_frame);
+        /***/
+        output_frame->ActivateNodes(item, is_dead, output_iter, outputs, ready);
+        input_frame->DecrementOutstandingOps(&impl_->gview_, input_iter, ready);
+    } else if (item->is_exit) {
+        // 若节点类型是exit
+        /***/
+        output_frame->ActivateNodes(item, is_dead, output_iter, outputs, ready);
+        input_frame->DecrementOutstandingOpsLocked(&impl_->gview_, input_iter, ready);
+    } else {
+        // 若节点类型是next_iter
+        /***/
+        output_frame->ActivateNodes(item, is_dead, output_iter, outputs, ready);
+        input_frame->DecrementOutstandingOpsLocked(&impl_->gview_, input_iter, ready);
+    }
+    
+    // 节点处理完成后，判断当前帧是否执行完成，以及递归的判断父帧有没有执行完毕
+    if (is_frame_done) {
+        /***/
+        DeleteFrame(input_frame, ready);
+        if (parent_frame != nullptr) {
+            CleanupFramesIterations(parent_frame, parent_iter, ready);
+        }
+    }
+}
+```
+
+根据不同的节点类型会为其做不同的操作，但基本会包含两个操作，一个是激活节点，一个是减少当前未执行节点的数目。在激活节点函数中
+
+```c++
+void ExecutorState::FrameState::ActivateNodes(const NodeItem* item,
+                                              const bool is_dead, int64 iter,
+                                              EntryVector* outputs,
+                                              TaggedNodeSeq* ready) {
+    /***/
+    // 若目标节点准备好了，将其放入ready队列中
+    if (dst_ready) {
+      if (dst_item->is_control_trigger) dst_dead = false;
+      ready->emplace_back(dst_item, this, iter, dst_dead);
+      iter_state->outstanding_ops++;
+    }
+}
+```
+
+最后处理的函数为NodeDone
+
+```c++
+bool ExecutorState::NodeDone(const Status& s, const TaggedNodeSeq& ready,
+                             NodeExecStatsInterface* stats,
+                             TaggedNodeReadyQueue* inline_ready) {
+    /***/
+    ScheduleReady(ready, inline_ready);
+    /***/
+}
+```
+
+对上述过程进行总结如下：
+
+1.ExecutorImpl::RunAsync作为执行器的入口，其实它是把实际执行的工作交给了ExecutorState::RunAsync，这个函数进一步调用了ScheduleReady函数来调度执行，记住这个函数有两个输入，ready和inline_ready，在这里，inline_ready是空的。也就是说，这里调用ScheduleReady的作用是，给根节点队列里的节点，分别分配一个线程执行，执行的过程调用的是Process函数。
+
+2.在Process函数内部，我们还要记住一点，这个函数的输入只有节点，没有ready和inline_ready，这两个变量都是在Process函数内部新创建的。也就是说，一旦把一个节点交给Process函数去处理，这个节点所在的队列跟Process函数就没有任何关系了。处理的过程分为输入准备、实际计算、输出准备、输出传递、节点完成五个步骤。其中只有输出传递和节点完成会对ready和inline_ready结构产生影响。
+
+3.我们把节点分按照异步节点和同步节点分开处理。对于异步节点，NodeDone函数的最后一个参数inline_ready是空，也就是说，在异步执行时，调用NodeDone中的ScheduleReady时，跟RunAsync中的情形是一样的，直接调度ready中的节点就好了，不需要处理inline_ready的情况。对于同步节点，NodeDone函数的最后一个参数inline_ready是当前Process函数中新创建的inline_ready，也就是说，传递给ScheduleReady的inline_ready是非空的，这也就有可能对inline_ready的结构做修改，注意这里的inline_ready是从Process函数中创建的，每个Process函数都对应一个全新的线程，也就是说，每个全新的线程里面只有一个inline_ready结构，其中的函数不断的修改它的内容，然后不断的对它进行调度执行。注意Process中的while大循环是针对inline_ready队列执行的。
